@@ -1,0 +1,440 @@
+---
+title: "BF528 RNAseq Project"
+output:
+  html_document:
+    df_print: paged
+---
+
+## MultiQC Analysis 
+
+We performed quality control analysis of the RNAseq reads using FastQC, STAR, and MultiQC to evaluate the base quality scores, adapter contamination, sequence duplication, and alignment statistics. The overall sequencing quality appears to be good, but a few metrics are worth noting.
+The FastQC per sequence quality scores are high with all samples having phred scores above 30 with the majority base distribution above 35. Looking at the phred quality scores based on position there is a slight decrease in quality at the 3' ends of the samples. However, the lowest score is remains above 25 so this is not a reason for concern. Adapter contamination is minimal, and no significant overrepresentation of specific sequences was detected. The STAR alignment results show a high proportion of uniquely mapped reads indicating successful alignment to the reference genome acrosss all samples (>90% for all samples). One potential concern is the proportion of duplicate reads. A higher proportion of duplicate reads in an RNA seq experiment is expected at about 10-40% but in this case the duplicate reads proportion across all samples is around 75%. The consistency of this duplication rate across samples suggests a systematic factor rather than an isolated technical artifact. This should be considered when interpreting expression levels, as it may reflect high expression of certain transcripts or potential library preparation effects.
+
+
+! [General MultiQC Statistics](/projectnb/bf528/students/spatra/project-1-sofpatra/general _stats.png)
+
+! [STAR Summary Statistics](/projectnb/bf528/students/spatra/project-1-sofpatra/STAR_stats.png)
+! [STAR Alignment Scores](/projectnb/bf528/students/spatra/project-1-sofpatra/Alignment_score.png)
+
+## Inspecting the counts data
+```{r setup, include = FALSE, message = FALSE}
+library(ggplot2)
+library(tidyverse)
+library(data.table)
+library(DESeq2)
+
+library(enrichR)
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install(c("clusterProfiler", "org.Mm.eg.db", "enrichplot"))
+#install.packages("ggplot2")
+
+library(clusterProfiler)
+library(org.Hs.eg.db)  # Use 'org.Mm.eg.db' for mouse data
+library(enrichplot)
+library(ggplot2)
+library(biomaRt)
+library("RColorBrewer")
+library(pheatmap)
+library(knitr)
+library(msigdbr)
+library(dplyr)
+library(fgsea)
+
+```
+
+Read in data, create metadata
+```{r}
+## Read the CSV file
+countsdata <- read_csv('/projectnb/bf528/students/spatra/project-1-sofpatra/results/counts_matrix.csv')  
+#Inspect countsdata 
+head(countsdata)
+```
+Get metadata from the column names
+```{r}
+sample_names <- colnames(countsdata[,-1])
+
+#create metadata dataframe
+metadata <- data.frame(
+  Sample = sample_names,
+  Condition = ifelse(grepl("^co", sample_names), "Control", "Experimental"),
+  Replicate = as.integer(sub(".*_rep", "", sample_names))
+)
+```
+
+
+## Filtering the counts data 
+
+Filtering the counts data ahead of the normalization and differential analysis allows for the reduction of the multiple testing burden of the analysis. I chose to filter out the counts data for lowly expressed genes in our dataset. I filtered out genes that have low expression across all samples. Since we have 6 samples I filtered out genes for which the sum of counts across all samples is less than or equal to 10. 
+```{r}
+#filter counts based on row sums greater than 10 
+filtered_counts <- countsdata[rowSums(countsdata[-1]) >= 10, ]
+
+#get number of genes before filtering 
+before_filtering <-nrow(countsdata)
+
+#get number of genes after filtering
+after_filtering <- nrow(filtered_counts)
+
+#create summary table 
+filter_summary <- data.frame(
+  "Stage" = c("Before Filtering", "After Filtering"),
+  "Number of Genes" = c(before_filtering, after_filtering)
+)
+
+kable(filter_summary, col.names = c("Stage", "Number of Genes"), caption = "Effect of Filtering on Gene Counts")
+
+
+
+```
+```{r}
+#plot count distributions before and after filtering 
+prefilter_sums <- rowSums(countsdata[-1])
+postfilter_sums <- rowSums(filtered_counts[-1])
+
+#show two plots side by side 
+par(mfrow = c(1,2))
+
+#create histograms 
+hist(log10(prefilter_sums +1), main = "Sum of Counts Before Filtering", xlab = "Log10(Sum of Counts)", col = "lightpink", breaks = 10)
+hist(log10(postfilter_sums +1), main = "Sum of Counts After Filtering", xlab = "Log10(Sum of Counts)", col = "lightblue", breaks = 10)
+```
+
+### Running DEseq2 analysis
+```{r, message = FALSE}
+#create count matrix
+count_mat <- as.matrix(filtered_counts[-1])
+row.names(count_mat) <- filtered_counts$gene
+
+design <- formula(~Condition)
+
+#create DeSeq object
+dds <- DESeqDataSetFromMatrix(
+  countData=count_mat,
+  colData=metadata,
+  design=design
+)
+
+#run DESeq
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+```{r}
+#create results tibble
+res <- results(dds, name="Condition_Experimental_vs_Control")
+exp_vs_control_de <- as_tibble(res) %>%
+  mutate(gene=rownames(res)) %>%
+  relocate(gene) %>%
+  arrange(padj)
+
+#get gene symbols from mapping file
+id_mapping <- read_delim('/projectnb/bf528/students/spatra/project-1-sofpatra/results/id_to_symbol.txt')
+
+colnames(id_mapping) <- c("gene", "Symbol")
+
+mapped_results <- exp_vs_control_de %>%
+  left_join(id_mapping) %>%
+  relocate("Symbol")
+
+#save results csv
+write.csv(mapped_results, "/projectnb/bf528/students/spatra/project-1-sofpatra/results/deseq_results.csv", row.names = FALSE)
+```
+
+
+
+Create table with top 10 significant genes
+```{r}
+top10 <- mapped_results[1:10,]
+top10$pvalue <- formatC(top10$pvalue, format = "e", digits = 2)
+top10$padj <- formatC(top10$padj, format = "e", digits = 2)
+kable(top10, caption = "Top ten significant genes.")
+```
+
+### Extracting genes with a specified significance level
+```{r}
+
+#Choose an appropriate padj threshold and report the number of significant genes at this threshold.
+padj_threshold = 0.05
+
+filtered_results <- mapped_results %>%
+  filter(padj <= padj_threshold)
+
+num_genes = nrow(filtered_results)
+
+gene_list <- filtered_results$Symbol
+#save gene list to paste into DAVID
+write.csv(gene_list, "/projectnb/bf528/students/spatra/project-1-sofpatra/results/significant_genes.txt", row.names = FALSE)
+
+sprintf("There are % s significant genes at the padj threshold of % s", num_genes, padj_threshold) 
+```
+### Enrichment analysis using enrichR
+I performed an enrichment analysis using the EnrichR library, with DAVID as a secondary tool for confirmation, to analyze the significant differentially expressed genes identified in the previous step. The EnrichR results highlight several development-related processes enriched in our gene set. In the Reactome pathway database, the top two enriched terms are "Regulation of Gene Expression in Endocrine-Committed (NEUROG3+) Progenitor Cells" and "Regulation of Beta-Cell Development." Similarly, Gene Ontology (GO) biological processes include terms such as cardiac muscle development, septum morphogenesis, and regulation of developmental growth. These findings suggest that the differentially expressed genes in the experimental condition compared to the control are associated with developmental pathways, indicating that the experimental condition may influence key regulatory mechanisms involved in development. The DAVID web tool yielded similar enrichment terms, further supporting these results.
+
+```{r}
+dbs_all <- listEnrichrDbs()
+dbs <- c("Reactome_Pathways_2024","GO_Biological_Process_2021")
+enriched <- enrichr(gene_list, dbs)
+
+head(enriched$GO_Biological_Process_2021)  # Check results for GO BP
+enriched$Reactome_Pathways_2024  # Check KEGG results
+
+
+
+```
+### RNAseq Quality Control Plots 
+
+#### PCA
+```{r}
+vsd <- vst(dds)  # Use Variance Stabilizing Transformation (or rlog)
+plotPCA(vsd, intgroup="Condition")
+```
+#### Sample-to-sample Distance
+
+```{r}
+sampleDists <- dist(t(assay(vsd)))
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(vsd$Condition, vsd$Replicate, sep="-")
+colnames(sampleDistMatrix) <-NULL
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col=colors)
+```
+
+
+
+In the PCA plot, PC1 explains 86% of the variance, while PC2 accounts for 10%, together capturing the majority of the variation in the dataset. The samples cluster primarily by condition, with the controls forming a tight group and two of the experimental samples also clustering closely together. However, one experimental sample appears positioned between the control and experimental groups, suggesting it may exhibit intermediate characteristics. This sample warrants further investigation to determine whether its placement is due to biological variability, technical factors, or potential sample misclassification.
+
+This clustering pattern is further reinforced by the sample-to-sample distance analysis. The heatmap highlights the close relationship between the two experimental replicates and the strong clustering of the controls. The third experimental replicate appears potentially more similar to the control group than to its experimental counterparts. This could indicate batch effects, an issue with sample preparation, or true biological variation within the experimental condition. Further analysis would help clarify the nature of this outlier and its impact on the overall conclusions of the experiment. It might also be worthwhile to remove this replicate from the analysis altogether. 
+
+
+FGSEA 
+```{r}
+labeled_res <- mapped_results %>%
+  arrange(desc(log2FoldChange)) %>%
+  drop_na()
+  
+#create tibble with log2 fold change and names 
+
+log2fc_tibble <- tibble(Symbol = labeled_res$Symbol, log2FoldChange = labeled_res$log2FoldChange)
+
+
+# Get unique rows based on both Symbol and log2FoldChange
+unique_log2fc_tibble <- log2fc_tibble %>%
+  group_by(Symbol) %>%
+  summarize(log2FoldChange = mean(log2FoldChange, na.rm = TRUE)) %>%
+  ungroup()
+  
+# Convert to a named vector
+rnk_list <- setNames(unique_log2fc_tibble$log2FoldChange, unique_log2fc_tibble$Symbol)
+rnk_list <- na.omit(setNames(unique_log2fc_tibble$log2FoldChange, unique_log2fc_tibble$Symbol))
+
+
+# Get C2 canonical pathways for human
+c2_pathways <- msigdbr(species = "Homo sapiens", category = "C2")
+
+# Convert to a list of gene sets (like GMT format)
+pathways <- split(c2_pathways$gene_symbol, c2_pathways$gs_name)
+
+
+
+
+fgseaRes <- tibble(fgsea(pathways, rnk_list, 15, 500)) 
+```
+
+```{r}
+
+```
+
+```{r}
+#filter fgsea results 
+filtered_fgsea <- fgseaRes %>%
+  filter(pval <= 0.05) %>%
+  arrange(padj)
+
+filtered_fgsea
+
+```
+
+The fgsea results show an enrichment in chromatin modifications associated with developmental processes. The neuronal system pathway further suggests roles in neuronal development. These results seem to overlap with the EnrichR analysis which also showed developmental pathways. 
+
+
+
+```{r}
+padj_threshold = 0.01
+labeled_res <- mapped_results %>%
+    mutate(volc_plot_status = case_when(
+      padj < padj_threshold & log2FoldChange > 0 ~ "UP",
+      padj < padj_threshold & log2FoldChange < 0 ~ "DOWN",
+      TRUE ~ "NS"))
+table(labeled_res$volc_plot_status)
+
+
+
+ggplot(labeled_res, aes(x=log2FoldChange,y=-log10(padj), color = volc_plot_status)) +
+    geom_point() +
+    labs(title="Volcano Plot of DESeq2 differential expression results")+
+    theme_minimal()
+```
+
+
+
+```{r}
+top_pathways <- function(fgsea_results, num_paths){
+  top_paths_pos <- fgsea_results %>%
+    filter(NES > 0) %>%
+    arrange(padj) %>%
+    slice_head(n = num_paths)
+  
+  top_paths_neg <- fgsea_results %>%
+    filter(NES < 0) %>%
+    arrange(padj) %>%
+    slice_head(n = num_paths)
+  
+  # Combine the two sets of pathways
+  top_paths <- bind_rows(top_paths_pos, top_paths_neg) %>%
+    mutate(
+      Pathway = str_replace_all(pathway, "_", " ") %>% str_wrap(),
+      Direction = ifelse(NES >0, "Positive", "Negative")
+    )
+  
+  # Plot the bar chart
+barchart <- ggplot(top_paths, aes(x = reorder(Pathway, NES), y = NES, fill = NES > 0)) +
+  geom_col() +
+  scale_fill_manual(values = c("blue", "red"), labels = c("Negative NES", "Positive NES")) +
+  labs(title = "fgsea reults for Hallmark MSigDB gene set", y = "Normalized Enrichment Score (NES)", x= NULL) +
+  theme_minimal(base_size =12) +
+  theme(axis.text.y = element_text(size =7),
+        plot.title = element_text(size=8),
+        axis.title.x = element_text(size = 6)) + coord_flip()+
+  guides(fill = "none")
+
+    return(barchart)
+}
+
+top_pathways(filtered_fgsea, 10)
+
+```
+### Discussion
+The authors of the original paper identified 319 upregulated and 412 downregulated genes using the FDR significance threshold of 0.01. Applying the padj<0.01 filter to my results, I got similar numbers of 400 downregulated genes and 312 upregulated genes Using the EnrichR method for gene set enrichment with the reactome database, both my gene set enrichment analysis (GSEA) and the published study identified key Reactome pathways related to extracellular matrix (ECM) organization, neuronal system function, and beta-cell development, indicating a shared biological theme in the differentially expressed genes. However, there are some differences in the specific pathways enriched. My analysis highlighted pathways related to IGF transport regulation, TP53-mediated transcription of cell death genes, and neurofascin interactions, while the published study emphasized integrin interactions, ECM proteoglycans, and receptor tyrosine kinase signaling.
+
+The FGSEA results highlight FISCHER_DIRECT_P53_TARGETS_META_ANALYSIS and GRUETZMANN_PANCREATIC_CANCER_UP as the only significantly enriched gene sets, which suggests a strong signal for TP53-mediated transcriptional regulation and a potential link to pancreatic cancer-related gene expression changes. The discrepancy between my results and those from the published study could be due to differences in pathway databases used, gene ranking methods, or statistical thresholds.
+
+
+### Methods 
+
+The FASTQ files from the sequencing experiment conducted by Chandra et al. were first assessed for quality using FASTQC (v0.12.1). STAR (v2.7.11b) was used to generate a genome index for the human reference genome and to align the sequencing reads to the reference. The quality of the raw and aligned reads was further evaluated using MultiQC (v1.25).
+
+Gene-level counts were generated from the aligned reads using VERSE (v0.1.5), and the resulting count data from all samples were combined into a single counts matrix. Genes with low expression, defined as a total count ≤10 across all samples, were filtered out before differential expression analysis.
+
+DESeq2 was used to identify differentially expressed genes, with significance determined at a false discovery rate (FDR) threshold of p-adjusted < 0.05. Principal component analysis (PCA) and a sample distance matrix were used to explore overall expression patterns and sample relationships.
+
+For functional analysis, gene set enrichment was performed using the EnrichR package with the Reactome database. Additionally, FGSEA was applied to assess pathway enrichment based on gene-level ranking.
+
+#### Differences in Methods 
+In my methods we did not trim adapter sequences or low quality reads and in the publication the authors used Cutadapt to remove adapter sequences. Not trimming adapters could have lead to the inclusion of some lower quality bases. The authors also used an older version of STAR which could lead to some alignment differences. 
+
+In our methods we used VERSE for gene level counting compared to featureCounts being used by the authors of the publication. They also had a higher filtering threshold. <50 reads across all sampes. This could have introduced some noise to my results. They also used Fdrtool and stricted FDR threshold of 0.01. 
+
+Finally we used different enrichment analysis tools which may lead to variation in detected pathways. 
+
+
+## Discussion Questions 
+
+### RNAseq
+
+1. List the major high-level steps of a basic RNAseq experiment to look for
+differentially expressed genes. At each step, list what data you need to perform
+each step and what format they are in (if applicable). At minimum, there are 4
+essential steps.
+
+
+The starting point of a basic RNA-seq experiment are the sequencing reads in .fastq format. The first step is to perform sample quality control with FastQC. The second step is align the reads to the reference genome using a splice-aware aligner like STAR. For this step the input is the fastq reads and the output is a bam file. The third step is post alignment quality control the input for which is the bam file. The fourth major step is the quantification of alignments for which the bam and gtf files are needed. This is followed by filtering, normalization, and analysis of the counts for which the counts csv is needed.
+
+
+2. Consider the following FastQC plot.
+
+2a. What aspect of the data does this plot show?
+
+This plot shows the distribution of the GC content across all the sequences in a sequencing experiment.
+
+2b. Make an interpretation of this plot assuming the data type was RNASeq.
+
+The GC distribution is expected to follow a normal distribution but peaks in the distribution could indicate over-represented sequences. 
+
+2c. Do you think this plot indicates there was a problem with the dataset?
+Explain your answer.
+
+The second peak suggests an overrepresentation of certain GC-rich sequences. This could be due to adapter contamination, rRNA contamination, or PCR amplification bias. Further investigation is needed to determine the cause.
+
+2d. Make a hypothesis about what the problem represents. Outline a bioinformatics
+strategy that would enable you to confirm your hypothesis. 
+
+ In this case it is possible that the second peak indicates the presence of adapter sequences that need to be trimmed. You can see which sequences are overrepresented and creating the second peak. If these are indeed adapter sequences - they can be trimmed off using a software like trimmomatic. 
+If these are rRNA sequences you could parse the reads and filter for GC high sequences. After pulling out these sequences you can BLAST these to confirm if these are rRNA contamination. Could also align the reads to rRNA sequences. 
+3. What is a splice-aware aligner? When is it important to use a splice-aware
+aligner?
+
+A splice-aware aligner (STAR, HISAT2) recognizes exon-intron boundaries and correctly maps reads spanning splice junctions. This is essential for RNA-seq because many reads come from spliced mRNA. Without a splice-aware aligner, reads spanning exon-exon junctions may be discarded or incorrectly mapped.
+
+4. What does a “gene-level” count as produced by VERSE or any other counting
+tool in a RNAseq experiment represent?
+
+A gene-level count represents the number of reads that align to a given gene's exons. The sum of the union of all a genes exon counts. These counts are used to estimate gene expression but must be normalized to account for gene length and sequencing depth. 
+
+5. In your own words, briefly describe what information the matching GTF for a
+reference genome stores.
+A GTF (Gene Transfer Format) file stores gene annotations, including genomic coordinates of genes, transcripts, exons, coding sequences (CDS), UTRs, and other regulatory elements.
+
+6. When counting alignments using VERSE or any other utility, why do we need to
+provide the matching reference genome GTF file?
+
+We need the GTF file because the alignments contain sequencing reads that need to be assigned to the genomic features like genes and exons. These features are necessary for read assignment. 
+
+
+7. Let’s pretend that this was a GSEA result from an experiment where we treated
+293T cells with a drug and compared changes in gene expression to wild-type
+cells treated with a vehicle control. The differential expression results are
+relative to the control cells (i.e. a positive fold change means a gene is
+upregulated upon treatment with the drug)
+
+Assume the following result is statistically significant with a positive NES
+(normalized enrichment score) and that it represents a GSEA experiment performed
+on the entire list of genes discovered in the experiment ranked by
+log2FoldChange (i.e. genes that are “upregulated” in the cells treated with drug
+are on the “left” and genes that are “downregulated” due to treatment are on the
+“right”).
+
+
+
+7a. Form a valid interpretation / conclusion of the results shown in the plot
+given the above setup.
+
+There is an enrichment of genes in the acute inflammatory response gene set in our differential expression results. These genes are upregulated in our experimental condition compared to the control. This suggests that the inflammatory response is involved in the drugs activity. 
+
+
+7b. Now consider that all of the genes driving the enrichment are all activators
+of the inflammatory pathway. Does your interpretation change and if so, how?
+
+Yes, this provides more context suggesting that the drug elicits an inflammatory response in the cells. 
+
+7c. Finally, consider that all of the genes driving the enrichment all function
+to inhibit inflammation. Does your interpretation change and if so, how?
+
+Yes, this suggests the opposite drug mechanism that the drug suppresses inflammatory response in the cells.
+
+8. Rank the following quality control metrics for a 2x100nt paired-end illumina 
+mRNAseq dataset from most concerning to least concerning. Provide a brief
+statement on where you ranked each and why. Assume that the data has not been
+processed and was provided as-is from the sequencing machine. 
+
+
+- Unequal Read Lengths (highly concerning could be due to sequencing errors - after sequencing all reads should be about the same length)
+- Unequal number of forward and reverse reads (highly concerning can indicate sample preparation or sequencing issues)
+- 50% of reads are multimapped after alignment to the appropriate genome (suggests poor genome annotation or poor quality sequencing)
+- Nucleotide frequencies of ACTG are not equal over the entire read (depending on where this is could be concerning)
+- 15% of reads have identical sequences (high levels of duplicates can happen with highly expressed genes)
+- Average PHRED score < 20 in the last 10 bases (mildly concerning because the poor base quality could lead to misalignment but this is at the edges can be addressed)
+- 10% of reads are unmapped after alignment to the appropriate genome (10% is not that high so this is not concerning at all)
+- Non-random nucleotide distribution in the first 6 bases (this is not really concerning it is edge effect)
